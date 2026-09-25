@@ -72,7 +72,7 @@ token=$(op-cache read $GITHUB_TOKEN)
 | Command | What it does |
 |---|---|
 | `op-cache read <ref> [op flags]` | The secret, from memory when possible. On a miss it runs `op read` with the same arguments and remembers the answer. |
-| `op-cache run -- <command>` | Runs the command with every `op://` value in the environment resolved, the way `op run` does. |
+| `op-cache run -- <command>` | Runs the command with every `op://` value in the environment resolved, the way `op run` does. Whatever the cache is missing is fetched behind one `op run`, so a cold cache costs one sign-in prompt, not one per reference. |
 | `op-cache config` | Interactive setup of everything below. |
 | `op-cache status` | Whether the daemon is up and how it's configured. |
 | `op-cache inspect` | Every reference in memory, a masked peek at its value, and when it expires. |
@@ -137,7 +137,11 @@ for one invocation.
 - The client does the fetching. On a miss it runs `op read` with your terminal
   attached, so a locked vault prompts you the same way `op` always has, then
   hands the result to the daemon. The daemon never talks to 1Password itself.
-- A failed `op read` is not cached, and its exit code and stderr pass through.
+- `run` gathers its misses into a single `op run --no-masking`, whose child is
+  op-cache again (a hidden `__emit`), handing the resolved values back on a pipe.
+  One op process is one sign-in prompt.
+- A failed `op read` or `op run` is not cached, and its exit code and stderr
+  pass through.
 - If the daemon can't be started, `read` and `run` fall back to plain `op`.
 - Secrets never touch disk and never appear on a command line. `inspect` masks
   values inside the daemon before they cross the socket.

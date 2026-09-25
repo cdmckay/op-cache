@@ -18,6 +18,16 @@ case "$1" in
       *" -o "*) echo "passthrough: $*" ;;
       *) printf 'secret-for-%s\n' "$2" ;;
     esac ;;
+  run)
+    [ "$2" = "--no-masking" ] || { echo "passthrough: $*"; exit 0; }
+    shift 3
+    for name in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=op:\/\/.*/\1/p'); do
+      eval "ref=\$$name"
+      case "$ref" in *fail*) echo "stub: no such item" >&2; exit 3 ;; esac
+      echo "resolve $ref" >> "$OP_STUB_LOG"
+      export "$name=secret-for-$ref"
+    done
+    exec "$@" ;;
   *) echo "passthrough: $*" ;;
 esac
 "#;
@@ -76,7 +86,7 @@ impl Harness {
         fs::read_to_string(self.dir.path().join("op.log"))
             .unwrap()
             .lines()
-            .map(String::from)
+            .map(|l| l.replace(env!("CARGO_BIN_EXE_op-cache"), "op-cache"))
             .collect()
     }
 }
@@ -154,7 +164,106 @@ fn run_resolves_op_references_in_the_environment() {
         h.stdout(&["read", "op://v/tok/credential"]),
         "secret-for-op://v/tok/credential\n"
     );
-    assert_eq!(h.op_calls(), ["read op://v/tok/credential"]);
+    assert_eq!(
+        h.op_calls(),
+        [
+            "run --no-masking -- op-cache __emit 1",
+            "resolve op://v/tok/credential"
+        ]
+    );
+}
+
+#[test]
+fn run_fetches_every_cold_reference_behind_one_op_run() {
+    let h = Harness::new("");
+    let mut cmd = h.op_cache(&[
+        "run",
+        "--",
+        "sh",
+        "-c",
+        "printf '%s|%s|%s|%s' \"$A\" \"$B\" \"$C\" \"$PLAIN\"",
+    ]);
+    cmd.env("A", "op://v/a/f")
+        .env("B", "op://v/b/f")
+        .env("C", "op://v/c/f")
+        .env("PLAIN", "op-less");
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "secret-for-op://v/a/f|secret-for-op://v/b/f|secret-for-op://v/c/f|op-less"
+    );
+
+    let mut calls = h.op_calls();
+    calls.sort();
+    assert_eq!(
+        calls,
+        [
+            "resolve op://v/a/f",
+            "resolve op://v/b/f",
+            "resolve op://v/c/f",
+            "run --no-masking -- op-cache __emit 3",
+        ]
+    );
+
+    for reference in ["op://v/a/f", "op://v/b/f", "op://v/c/f"] {
+        assert_eq!(
+            h.stdout(&["read", reference]),
+            format!("secret-for-{reference}\n")
+        );
+    }
+    assert_eq!(h.op_calls().len(), 4);
+}
+
+#[test]
+fn run_only_fetches_what_the_cache_is_missing() {
+    let h = Harness::new("");
+    h.stdout(&["read", "op://v/a/f"]);
+    let mut cmd = h.op_cache(&["run", "--", "sh", "-c", "printf '%s|%s' \"$A\" \"$B\""]);
+    cmd.env("A", "op://v/a/f").env("B", "op://v/b/f");
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "secret-for-op://v/a/f|secret-for-op://v/b/f"
+    );
+    assert_eq!(
+        h.op_calls(),
+        [
+            "read op://v/a/f",
+            "run --no-masking -- op-cache __emit 1",
+            "resolve op://v/b/f"
+        ]
+    );
+}
+
+#[test]
+fn run_fetches_a_reference_shared_by_two_variables_once() {
+    let h = Harness::new("");
+    let mut cmd = h.op_cache(&["run", "--", "sh", "-c", "printf '%s|%s' \"$A\" \"$B\""]);
+    cmd.env("A", "op://v/x/f").env("B", "op://v/x/f");
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "secret-for-op://v/x/f|secret-for-op://v/x/f"
+    );
+    assert_eq!(
+        h.op_calls(),
+        [
+            "run --no-masking -- op-cache __emit 1",
+            "resolve op://v/x/f"
+        ]
+    );
+}
+
+#[test]
+fn a_failed_batch_caches_nothing_and_keeps_its_exit_code() {
+    let h = Harness::new("");
+    let mut cmd = h.op_cache(&["run", "--", "sh", "-c", "echo ran"]);
+    cmd.env("A", "op://v/ok/f").env("B", "op://v/fail/f");
+    let out = cmd.output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no such item"));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("ran"));
+    assert_eq!(h.stdout(&["inspect"]), "op-cache: nothing cached\n");
 }
 
 #[test]

@@ -11,16 +11,22 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, exit};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use client::Client;
 use config::Config;
 use protocol::{Request, Response};
 
 const OP_REF_PREFIX: &str = "op://";
+
+/// The hidden command `op run` execs to hand a batch of values back, and the
+/// environment variables it finds them in.
+const EMIT: &str = "__emit";
+const BATCH_PREFIX: &str = "OP_CACHE_BATCH_";
 
 /// Each command's name, what it does, and what its arguments are if it takes any.
 const COMMANDS: &[(&str, &str, &str)] = &[
@@ -91,6 +97,7 @@ fn dispatch(config: &Config) -> Result<()> {
         ["clear"] => send(config, Request::Clear, "cleared", "nothing to clear"),
         ["stop"] => send(config, Request::Stop, "stopped", "not running"),
         ["daemon"] => daemon::run(config),
+        [EMIT, count] => emit(count),
         _ => Err(op::exec(&config.op, &args)),
     }
 }
@@ -154,16 +161,9 @@ fn run(config: &Config, args: &[OsString]) -> Result<()> {
         return Err(op::exec(&config.op, &with_subcommand("run", args)));
     };
     let client = Client::connect_or_spawn(&config.socket_path());
-    let mut resolved = HashMap::new();
     let vars =
         env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-    for (name, reference) in op_refs(vars) {
-        let mut value = resolve(config, client.as_ref(), &[OsString::from(&reference)])?;
-        if value.last() == Some(&b'\n') {
-            value.pop();
-        }
-        resolved.insert(name, String::from_utf8(value)?);
-    }
+    let resolved = resolve_all(config, client.as_ref(), &op_refs(vars))?;
     let err = Command::new(&command[0])
         .args(&command[1..])
         .envs(resolved)
@@ -203,26 +203,125 @@ fn op_refs(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)
 /// The read-through path: answer from the daemon, otherwise ask op and tell
 /// the daemon what it said. With no daemon it is just `op read`.
 fn resolve(config: &Config, client: Option<&Client>, args: &[OsString]) -> Result<Vec<u8>> {
-    let key = cache_key(args);
-    if let Some(client) = client
-        && let Ok(Response::Hit { value }) = client.call(&Request::Get { key: key.clone() })
-    {
+    if let Some(value) = cached(client, args) {
         return Ok(value);
     }
     let output = op::read(&config.op, args)?;
     if !output.status.success() {
         exit(op::exit_code(output.status));
     }
-    if let Some(client) = client {
-        let _ = client.call(&Request::Put {
-            key,
-            value: output.stdout.clone(),
-            ttl_secs: config
-                .ttl_for(&args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>())
-                .map(|d| d.as_secs()),
-        });
-    }
+    remember(config, client, args, output.stdout.clone());
     Ok(output.stdout)
+}
+
+/// `run`'s read-through path, keyed by variable name. Hits come from the
+/// daemon, and every miss is fetched behind a single `op run`, so a cold cache
+/// costs one sign-in prompt however many references the environment holds.
+/// Values come back without the newline `op read` prints after them.
+fn resolve_all(
+    config: &Config,
+    client: Option<&Client>,
+    refs: &[(String, String)],
+) -> Result<HashMap<String, String>> {
+    let mut values: HashMap<&str, Vec<u8>> = HashMap::new();
+    let mut misses: Vec<&str> = Vec::new();
+    for (_, reference) in refs {
+        if values.contains_key(reference.as_str()) || misses.contains(&reference.as_str()) {
+            continue;
+        }
+        match cached(client, &[OsString::from(reference)]) {
+            Some(value) => {
+                values.insert(reference, value);
+            }
+            None => misses.push(reference),
+        }
+    }
+    if !misses.is_empty() {
+        for (reference, value) in misses.iter().zip(fetch_batch(config, &misses)?) {
+            // Stored the way `op read` prints it, since `read` shares the entry.
+            let printed = [value.as_slice(), b"\n"].concat();
+            remember(
+                config,
+                client,
+                &[OsString::from(reference)],
+                printed.clone(),
+            );
+            values.insert(reference, printed);
+        }
+    }
+    refs.iter()
+        .map(|(name, reference)| {
+            let mut value = values[reference.as_str()].clone();
+            if value.last() == Some(&b'\n') {
+                value.pop();
+            }
+            Ok((name.clone(), String::from_utf8(value)?))
+        })
+        .collect()
+}
+
+/// Fetches `references` behind one `op run`, whose child is this binary's
+/// hidden `__emit`, handing the values back as JSON on stdout, so they never
+/// touch argv or disk. A failed `op run` exits with its code, as a failed
+/// `op read` does, and nothing is cached.
+fn fetch_batch(config: &Config, references: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let child = [
+        env::current_exe()?.into_os_string(),
+        OsString::from(EMIT),
+        OsString::from(references.len().to_string()),
+    ];
+    let output = op::run_batch(&config.op, references, BATCH_PREFIX, &child)?;
+    if !output.status.success() {
+        exit(op::exit_code(output.status));
+    }
+    let values: Vec<Vec<u8>> = serde_json::from_slice(&output.stdout)
+        .context("reading the values `op run` handed back")?;
+    anyhow::ensure!(
+        values.len() == references.len(),
+        "`op run` handed back {} values for {} references",
+        values.len(),
+        references.len()
+    );
+    Ok(values)
+}
+
+/// The child `op run` execs for a batch: reads the resolved values back out of
+/// its environment and writes them to stdout for the parent waiting on them.
+fn emit(count: &str) -> Result<()> {
+    let count: usize = count.parse().context("reading the batch size")?;
+    let values = (0..count)
+        .map(|i| {
+            let name = format!("{BATCH_PREFIX}{i}");
+            env::var_os(&name)
+                .map(OsString::into_vec)
+                .with_context(|| format!("{name} is not set"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    serde_json::to_writer(io::stdout(), &values)?;
+    Ok(())
+}
+
+/// The daemon's copy of a `read`, if there is a daemon and it has one.
+fn cached(client: Option<&Client>, args: &[OsString]) -> Option<Vec<u8>> {
+    match client?.call(&Request::Get {
+        key: cache_key(args),
+    }) {
+        Ok(Response::Hit { value }) => Some(value),
+        _ => None,
+    }
+}
+
+/// Hands a freshly fetched value to the daemon, with the lifetime its
+/// arguments earn.
+fn remember(config: &Config, client: Option<&Client>, args: &[OsString], value: Vec<u8>) {
+    let Some(client) = client else { return };
+    let _ = client.call(&Request::Put {
+        key: cache_key(args),
+        value,
+        ttl_secs: config
+            .ttl_for(&args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>())
+            .map(|d| d.as_secs()),
+    });
 }
 
 fn cache_key(args: &[OsString]) -> String {
