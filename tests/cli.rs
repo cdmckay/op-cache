@@ -1,5 +1,7 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::thread::sleep;
@@ -189,6 +191,38 @@ fn failed_reads_are_not_cached_and_keep_their_exit_code() {
     h.run(&["read", "op://v/fail/f"]);
     assert_eq!(h.op_calls().len(), 2);
     assert_eq!(h.stdout(&["inspect"]), "op-cache: nothing cached\n");
+}
+
+#[test]
+fn an_absurd_lifetime_is_capped_at_a_day_and_leaves_the_daemon_stoppable() {
+    let h = Harness::new("");
+    h.stdout(&["read", "op://v/i/f"]);
+
+    // Far too long to add to an Instant. It once panicked the daemon while it
+    // held its lock, after which every request, `stop` and the idle timeout
+    // among them, panicked in turn. Now it is capped at a day.
+    let mut stream = UnixStream::connect(h.socket()).unwrap();
+    stream
+        .write_all(
+            b"{\"op\":\"put\",\"key\":\"k\",\"value\":[1],\"ttl_secs\":18446744073709551615}\n",
+        )
+        .unwrap();
+    let mut reply = String::new();
+    BufReader::new(&stream).read_line(&mut reply).unwrap();
+    assert_eq!(reply, "{\"kind\":\"done\"}\n");
+
+    assert!(h.stdout(&["status"]).contains("cached   2"));
+    let inspect = h.stdout(&["inspect"]);
+    let capped = inspect.lines().find(|l| l.starts_with("k ")).unwrap();
+    assert!(
+        capped.ends_with("in 1day") || capped.contains("in 23h 59m"),
+        "{inspect}"
+    );
+    assert_eq!(h.stdout(&["read", "op://v/i/f"]), "secret-for-op://v/i/f\n");
+    assert_eq!(h.op_calls(), ["read op://v/i/f"]);
+    assert_eq!(h.stdout(&["stop"]), "op-cache: stopped\n");
+    sleep(Duration::from_millis(100));
+    assert!(!h.socket().exists());
 }
 
 #[test]

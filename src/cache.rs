@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// The longest a cached secret lives, whatever lifetime it was given. A day
+/// covers any real schedule, and the bound keeps an absurd lifetime from
+/// overflowing the clock, which once panicked the daemon while it held its lock.
+/// `None`, until the daemon exits, is not a lifetime and is left alone.
+pub const MAX_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 struct Entry {
     value: Vec<u8>,
     expires_at: Option<Instant>,
@@ -24,7 +30,7 @@ impl Cache {
     }
 
     pub fn put(&mut self, key: String, value: Vec<u8>, ttl: Option<Duration>, now: Instant) {
-        let expires_at = ttl.map(|t| now + t);
+        let expires_at = ttl.map(|t| now + t.min(MAX_TTL));
         self.entries.insert(key, Entry { value, expires_at });
     }
 
@@ -85,5 +91,34 @@ mod tests {
 
         cache.clear();
         assert!(cache.entries(expired).is_empty());
+    }
+
+    #[test]
+    fn lifetimes_are_capped_at_a_day() {
+        let mut cache = Cache::default();
+        let t0 = Instant::now();
+        cache.put("huge".into(), b"h".to_vec(), Some(Duration::MAX), t0);
+        cache.put("week".into(), b"w".to_vec(), Some(MAX_TTL * 7), t0);
+        cache.put(
+            "hour".into(),
+            b"o".to_vec(),
+            Some(Duration::from_secs(3600)),
+            t0,
+        );
+        cache.put("exit".into(), b"e".to_vec(), None, t0);
+        assert_eq!(
+            cache.entries(t0),
+            vec![
+                ("exit", &b"e"[..], None),
+                ("hour", &b"o"[..], Some(Duration::from_secs(3600))),
+                ("huge", &b"h"[..], Some(MAX_TTL)),
+                ("week", &b"w"[..], Some(MAX_TTL)),
+            ]
+        );
+
+        let a_day_on = t0 + MAX_TTL;
+        assert_eq!(cache.get("huge", a_day_on), None);
+        assert_eq!(cache.get("week", a_day_on), None);
+        assert_eq!(cache.get("exit", a_day_on), Some(&b"e"[..]));
     }
 }

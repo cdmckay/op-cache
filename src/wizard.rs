@@ -127,7 +127,7 @@ fn ask_lifetime(
     }
     let default = current.map(|d| humantime::format_duration(d).to_string());
     let answer: String = input("For how long?")
-        .placeholder(&format!("e.g. {example}, 30m, 2d"))
+        .placeholder(&format!("e.g. {example}, 30m, 1d"))
         .default_input(default.as_deref().unwrap_or(example))
         .validate(|s: &String| match parse_lifetime(s) {
             Ok(Some(_)) => Ok(()),

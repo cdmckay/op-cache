@@ -104,7 +104,8 @@ op = "op"               # the binary to call
 Out of the box a secret stays cached until the daemon exits, and the daemon
 runs until you `op-cache stop` or reboot. Set `ttl` to re-read from 1Password
 on a schedule, and `idle_timeout` to have the daemon shut itself down and drop
-everything after a quiet stretch.
+everything after a quiet stretch. A duration is capped at a day, here and in
+`[overrides]`; `until-exit` is not a duration and isn't capped.
 
 Individual references can have their own lifetime, and a key ending in `/`
 covers everything in that vault or item. The most specific match wins:
