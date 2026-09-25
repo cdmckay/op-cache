@@ -50,6 +50,8 @@ it on drop; keep that working when adding scenarios.
 - A reference's lifetime is the most specific `[overrides]` match, where a
   key ending in `/` covers everything under it, otherwise the global `ttl`.
 - A failed `op read` is never cached and its exit code is passed through.
+- `run` fetches every miss behind one `op run`: one prompt, however many
+  references the environment holds.
 - With no daemon reachable, `read` and `run` still work; they just call `op`.
 - The socket is mode 600 and lives in a per-user directory. Secrets never
   touch disk and never appear in argv.

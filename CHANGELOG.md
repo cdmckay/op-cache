@@ -24,6 +24,10 @@ In this fork:
 
 - A cached secret lives at most a day. A longer `ttl`, override, or requested
   lifetime is capped; `until-exit` is not a duration and is unaffected.
+- `op-cache run` fetches everything the cache is missing behind a single
+  `op run`, so a cold cache costs one sign-in prompt instead of one per
+  reference. The values come back through op-cache's hidden `__emit` child on a
+  pipe, never on a command line or on disk.
 
 ### Fixed
 
