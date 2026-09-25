@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,8 +46,9 @@ pub fn run(config: &Config) -> Result<()> {
         thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(1).min(idle));
-                if state.lock().unwrap().last_activity.elapsed() >= idle {
-                    shutdown(&socket);
+                match lock_state(&state) {
+                    Some(state) if state.last_activity.elapsed() < idle => {}
+                    _ => shutdown(&socket),
                 }
             }
         });
@@ -76,7 +77,9 @@ fn serve(
     BufReader::new(&stream).read_line(&mut line)?;
     let request: Request = serde_json::from_str(&line)?;
     let now = Instant::now();
-    let mut state = state.lock().unwrap();
+    let Some(mut state) = lock_state(state) else {
+        shutdown(socket)
+    };
     state.last_activity = now;
 
     let response = match request {
@@ -146,6 +149,15 @@ fn mask(value: &[u8]) -> String {
     format!("{head}••••••{tail}")
 }
 
+/// The state, or `None` if a thread panicked while holding it. Nothing behind a
+/// poisoned lock can be trusted, and every later request, `stop` and the idle
+/// timeout among them, would panic trying to take it, leaving a daemon that
+/// holds its secrets until it is killed. So callers shut down instead; the next
+/// client starts a fresh daemon.
+fn lock_state(state: &Mutex<State>) -> Option<MutexGuard<'_, State>> {
+    state.lock().ok()
+}
+
 fn shutdown(socket: &Path) -> ! {
     let _ = fs::remove_file(socket);
     std::process::exit(0)
@@ -153,12 +165,26 @@ fn shutdown(socket: &Path) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use super::mask;
+    use super::*;
 
     #[test]
     fn masking_keeps_only_the_ends_of_long_values() {
         assert_eq!(mask(b"ghp_abcdefghijklmnop\n"), "ghp••••••nop");
         assert_eq!(mask(b"short\n"), "••••••••");
         assert_eq!(mask(b"exactly12chr"), "exa••••••chr");
+    }
+
+    #[test]
+    fn a_poisoned_lock_is_refused_rather_than_unwrapped() {
+        let state = Mutex::new(State {
+            cache: Cache::default(),
+            last_activity: Instant::now(),
+        });
+        let _ = std::panic::catch_unwind(|| {
+            let _held = state.lock().unwrap();
+            panic!("poisoning the lock on purpose");
+        });
+        assert!(state.is_poisoned());
+        assert!(lock_state(&state).is_none());
     }
 }
